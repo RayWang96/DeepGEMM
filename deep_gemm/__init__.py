@@ -57,7 +57,8 @@ if version.parse(cuda_version) >= version.parse('12.1'):
         fp8_paged_mqa_logits,
         # Layout kernels
         transform_sf_into_required_layout,
-        get_mk_alignment_for_contiguous_layout
+        get_mk_alignment_for_contiguous_layout,
+        quantize_bf16_to_fp8
     )
 
     # Some alias for legacy supports

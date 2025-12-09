@@ -75,6 +75,7 @@ static void register_apis(pybind11::module_& m) {
       py::arg("num_groups") = std::nullopt, py::arg("is_sfa") = false,
       py::arg("disable_ue8m0_cast") = false);
 
+    m.def("quantize_bf16_to_fp8", &quantize_bf16_to_fp8);
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);

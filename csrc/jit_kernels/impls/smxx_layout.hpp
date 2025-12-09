@@ -11,6 +11,35 @@
 
 namespace deep_gemm {
 
+class QuantizeBF16ToFP8Runtime final
+    : public LaunchRuntime<QuantizeBF16ToFP8Runtime> {
+public:
+  struct Args {
+    void *in, *out, *sf_out;
+    size_t num_rows, num_cols;
+
+    LaunchArgs launch_args;
+  };
+
+  static std::string generate_impl(const Args &args) {
+    return fmt::format(R"(
+  #include <deep_gemm/impls/smxx_layout.cuh>
+  
+  using namespace deep_gemm;
+  
+  static void __instantiate_kernel() {{
+      auto ptr = reinterpret_cast<void*>(&quantize_bf16_to_fp8_kernel<
+      {}
+      >);
+  }};
+  )", 32);
+  }
+
+  static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+    DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.in, args.out, args.sf_out, args.num_rows, args.num_cols));
+  }
+};
+
 class TransposeFP32Runtime final: public LaunchRuntime<TransposeFP32Runtime> {
 public:
     struct Args {
@@ -259,6 +288,28 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
     const auto& runtime = compiler->build("pack_fp32_into_ue8m0", code);
     PackFP32IntoUE8M0Runtime::launch(runtime, args);
     return out;
+}
+
+static std::tuple<torch::Tensor, torch::Tensor> quantize_bf16_to_fp8(const torch::Tensor& in) {
+    int num_rows = in.size(0), num_cols = in.size(1);
+
+    const auto& out = torch::empty({num_rows, num_cols}, at::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat8_e4m3fn));
+    const auto& scale = torch::empty({num_rows, num_cols / 32}, at::TensorOptions().device(torch::kCUDA).dtype(torch::kInt));
+
+    const QuantizeBF16ToFP8Runtime::Args& args = {
+        .in = in.data_ptr(),
+        .out = out.data_ptr(),
+        .sf_out = scale.data_ptr(),
+        .num_rows = static_cast<size_t>(num_rows),
+        .num_cols = static_cast<size_t>(num_cols),
+        .launch_args = LaunchArgs(num_rows, 256)
+    };
+
+    const auto& code = QuantizeBF16ToFP8Runtime::generate(args);
+    const auto& runtime = compiler->build("quantize_bf16_to_fp8", code);
+    QuantizeBF16ToFP8Runtime::launch(runtime, args);
+
+    return {out, scale};
 }
 
 } // namespace deep_gemm

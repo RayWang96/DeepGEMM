@@ -173,4 +173,149 @@ __global__ void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* ks,
     }
 }
 
+using e8m0_t = uint8_t;
+using bfloat16 = nv_bfloat16;
+using fp8e4m3 = __nv_fp8_e4m3;
+
+// FP32 constants
+constexpr int32_t FP32_MANTISSA_BITS = 23;
+constexpr int32_t FP32_EXPONENT_BIAS = 127;
+
+// BF16 constants
+constexpr int32_t BF16_MANTISSA_BITS = 7;
+constexpr int32_t BF16_EXPONENT_BIAS = 127;
+
+// FP8E4M3 constants
+constexpr int32_t F8E4M3_MAX_POW2 = 8;
+constexpr float F8E4M3_MAX = 448.0;
+
+// FP8E8M0 constants
+constexpr int32_t E8M0_EXPONENT_BIAS = 127;
+
+__device__ __forceinline__
+uint16_t float2_to_e4m3x2(float2 x) {
+    uint16_t out;
+    // x.x -> 低 8 bit，x.y -> 高 8 bit
+    asm volatile(
+        "cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
+        : "=h"(out)
+        : "f"(x.y), "f"(x.x));
+    return out;
+}
+
+// Source:
+// https://github.com/NVIDIA/TransformerEngine/blob/1ae1d228d725a488621deba685bd26d6ee1cdb21/transformer_engine/common/utils.cuh#L937
+__device__ __forceinline__ e8m0_t float_to_e8m0(float val) {
+    // TODO: nan/inf needs to be set for any value
+    // of nan/inf in input not just amax.
+    if (isnan(val)) {
+      return 0xFF;
+    }
+    if (isinf(val)) {
+      return 0xFE;
+    }
+  #if ((__CUDA_ARCH_HAS_FEATURE__(SM100_ALL)) ||                                 \
+       (__CUDA_ARCH_HAS_FEATURE__(SM101_ALL)) ||                                 \
+       (__CUDA_ARCH_HAS_FEATURE__(SM120_ALL)))
+    uint16_t out;
+    asm volatile("{\n"
+                 "cvt.rp.satfinite.ue8m0x2.f32  %0, 0.0, %1;\n"
+                 "}"
+                 : "=h"(out)
+                 : "f"(val));
+    return *reinterpret_cast<e8m0_t *>(&out);
+  #else
+    if (val == 0.0f) {
+      return 0x00;
+    }
+    uint32_t val_u32 = *reinterpret_cast<uint32_t *>(&val);
+    e8m0_t exponent = (val_u32 >> FP32_MANTISSA_BITS);
+    uint32_t mantissa = val_u32 & 0x7FFFFF;
+    // Round up exponent and deal with satfinite.
+    if ((mantissa > 0 && exponent != 0xFE) &&
+        !(exponent == 0 && mantissa <= 0x400000)) {
+      ++exponent;
+    }
+    return exponent;
+  #endif
+}
+
+// Source:
+// https://github.com/NVIDIA/TransformerEngine/blob/1ae1d228d725a488621deba685bd26d6ee1cdb21/transformer_engine/common/utils.cuh#L971
+__device__ __forceinline__ float exp2f_rcp(e8m0_t biased_exp) {
+  return (biased_exp == 0)
+             ? 1
+             : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(biased_exp));
+}
+
+__device__ __forceinline__ uint4 ldg_uint4_ptx(const uint4* addr) {
+    uint4 v;
+    asm volatile(
+        "ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+        : "l"(addr));
+    return v;
+}
+
+struct float8 {
+    float x0, x1, x2, x3;
+    float x4, x5, x6, x7;
+};
+
+__device__ __forceinline__ float8 ldg_256B(const float* addr) {
+    float8 v;
+    asm volatile(
+        "ld.global.nc.v8.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
+        : "=f"(v.x0), "=f"(v.x1), "=f"(v.x2), "=f"(v.x3),
+          "=f"(v.x4), "=f"(v.x5), "=f"(v.x6), "=f"(v.x7)
+        : "l"(addr));
+    return v;
+}
+
+template <uint32_t SF_BLOCK_SIZE>
+__global__ __launch_bounds__(256, 1) void quantize_bf16_to_fp8_kernel(const __nv_bfloat16* in, __nv_fp8_e4m3* out, uint32_t* sf_out, size_t num_rows, size_t num_cols) {
+    size_t row_idx = blockIdx.x;
+    size_t col_idx = threadIdx.x * 4;
+
+    const float* row_ptr =  reinterpret_cast<const float*>(in + row_idx * num_cols);
+    uint2* out_row_ptr = reinterpret_cast<uint2*>(out + row_idx * num_cols);
+
+    float8 value[2];
+    value[0] = ldg_256B(row_ptr + col_idx * 4);
+    value[1] = ldg_256B(row_ptr + col_idx * 4 + 8);
+
+    uint2 fp8_value[4];
+    float amax = 0;
+
+    __nv_bfloat16* bf16_ptr = reinterpret_cast<__nv_bfloat16*>(&value[0]);
+    __nv_fp8_e4m3* fp8_value_ptr = reinterpret_cast<__nv_fp8_e4m3*>(&fp8_value[0]);
+
+    uint16_t* e4m3x2_ptr = reinterpret_cast<uint16_t*>(fp8_value_ptr);
+
+    for (int i = 0; i < 32; ++i) {
+        float fp32_value = bf16_ptr[i];
+        amax = max(amax, fabs(fp32_value));
+    }
+
+    float scale = amax / 448.0;
+
+    float inv_scale_fp32;
+    auto out_scale = float_to_e8m0(amax * (1.0f / 448.0f));
+    inv_scale_fp32 = exp2f_rcp(out_scale);
+
+    for (int i = 0; i < 16; ++i) {
+        float fp32_value_0 = bf16_ptr[i * 2];
+        float fp32_value_1 = bf16_ptr[i * 2 + 1];
+        float2 x = make_float2(fp32_value_0, fp32_value_1);
+        float2 scale = make_float2(inv_scale_fp32, inv_scale_fp32);
+        float2 x_scaled = __fmul2_rn(x, scale);
+        e4m3x2_ptr[i] = float2_to_e4m3x2(x_scaled);
+    }
+
+    out_row_ptr[col_idx] = fp8_value[0];
+    out_row_ptr[col_idx + 1] = fp8_value[1];
+    out_row_ptr[col_idx + 2] = fp8_value[2];
+    out_row_ptr[col_idx + 3] = fp8_value[3];
+}
+
 } // namespace deep_gemm
